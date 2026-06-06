@@ -59,10 +59,10 @@ CONFIG = {
         },
     ],
 
-    # LLM API 配置（使用你现有的 OpenAI 兼容接口）
-    "llm_api_url": os.environ.get("LLM_API_URL", "https://api.openai.com/v1/chat/completions"),
+    # LLM API 配置（Groq 免费方案，注册即用无需绑卡）
+    "llm_api_url": os.environ.get("LLM_API_URL", "https://api.groq.com/openai/v1/chat/completions"),
     "llm_api_key": os.environ.get("LLM_API_KEY", ""),
-    "llm_model": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+    "llm_model": os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile"),
 
     # 输出文件路径
     "output_dir": os.environ.get("OUTPUT_DIR", "./output"),
