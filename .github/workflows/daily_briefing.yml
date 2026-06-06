@@ -23,9 +23,6 @@ jobs:
 
       - name: Run Filter Script
         env:
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_API_URL: ${{ secrets.LLM_API_URL }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL }}
           OUTPUT_DIR: ./output
         run: python overseas_filter.py
 
