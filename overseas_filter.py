@@ -1,139 +1,246 @@
 #!/usr/bin/env python3
 """
-海外邮件自动抓取与商业过滤
-每天自动抓取 RSS 源 → 三道筛子深度过滤 → 结构化中文看板追加写入 Markdown
+海外商业情报自动抓取与过滤
+纯规则引擎版本 — 零 API Key、零注册、零费用
+GitHub Actions 每天早 9 点自动运行
 """
 
 import os
+import re
 import sys
 import json
 import hashlib
 import datetime
-import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-# ========== 依赖检测与自动安装 ==========
-REQUIRED_PACKAGES = {
-    "feedparser": "feedparser",
-    "requests": "requests",
-    "html2text": "html2text",
-}
-
+# ========== 依赖自动安装 ==========
 def ensure_dependencies():
     import subprocess
-    missing = []
-    for mod, pkg in REQUIRED_PACKAGES.items():
+    needed = []
+    for mod, pkg in [("feedparser","feedparser"), ("requests","requests"), ("html2text","html2text")]:
         try:
             __import__(mod)
         except ImportError:
-            missing.append(pkg)
-    if missing:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing, "-q"])
-        print(f"[依赖] 已安装: {', '.join(missing)}")
+            needed.append(pkg)
+    if needed:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *needed, "-q"])
 
 ensure_dependencies()
-
 import feedparser
 import requests
 import html2text
 
-# ========== 配置区（可按需修改） ==========
+# ========== 配置 ==========
 CONFIG = {
-    # RSS 源列表：TLDR AI + Hacker News + Indie Hackers
     "rss_sources": [
-        {
-            "name": "TLDR AI",
-            "url": "https://tldr.tech/ai/rss",
-            "max_articles": 10,
-        },
-        {
-            "name": "Hacker News (Best)",
-            "url": "https://hnrss.org/frontpage?points=30&count=15",
-            "max_articles": 8,
-        },
-        {
-            "name": "Product Hunt Today",
-            "url": "https://hnrss.org/frontpage",
-            "max_articles": 5,
-        },
+        {"name": "TLDR AI", "url": "https://tldr.tech/ai/rss", "max": 10},
+        {"name": "Hacker News Best", "url": "https://hnrss.org/frontpage?points=30&count=15", "max": 8},
+        {"name": "Product Hunt", "url": "https://hnrss.org/frontpage", "max": 5},
     ],
-
-    # LLM API 配置（Groq 免费方案，注册即用无需绑卡）
-    "llm_api_url": os.environ.get("LLM_API_URL", "https://api.groq.com/openai/v1/chat/completions"),
-    "llm_api_key": os.environ.get("LLM_API_KEY", ""),
-    "llm_model": os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile"),
-
-    # 输出文件路径
     "output_dir": os.environ.get("OUTPUT_DIR", "./output"),
     "output_file": "daily_business_briefing.md",
-
-    # 已处理文章的哈希去重文件
     "dedup_file": "processed_articles.json",
-
-    # 每篇文章请求间隔（秒），避免 API 限流
-    "request_interval": 2,
-
-    # 单篇文章最大字符数（超出截断）
-    "max_content_length": 8000,
+    "max_content_length": 6000,
 }
 
-# ========== 三道筛子过滤提示词 ==========
-FILTER_PROMPT = """你是顶级商业分析师。请用「三道筛子」严格过滤以下海外科技文章，输出结构化结果。
+# ========== 三道筛子：关键词 + 启发式规则 ==========
 
-## 输入文章
-标题：{title}
-来源：{source}
-原文：
-{content}
+# 第一道筛：赛道信号词（权重 3）
+SIGNAL_KEYWORDS = {
+    "ai": ["llm", "gpt", "openai", "claude", "gemini", "copilot", "stable diffusion",
+           "midjourney", "langchain", "vector database", "rag", "fine-tun", "agent",
+           "multimodal", "transformer", "diffusion model", "embedding", "token"],
+    "saas": ["mrr", "arr", "saas", "subscription", "plg", "product-led", "churn",
+             "retention", "ltv", "cac", "onboarding", "self-serve", "freemium"],
+    "devtools": ["api", "sdk", "open source", "github", "developer tool", "cli",
+                 "ide", "vs code", "copilot", "platform", "infrastructure", "devops"],
+    "automation": ["no-code", "low-code", "workflow", "zapier", "automation",
+                   "make.com", "n8n", "browser automation", "playwright", "selenium"],
+    "indie_hacker": ["indie hacker", "solo founder", "bootstrapped", "side project",
+                     "maker", "build in public", "#buildinpublic", "one-person"],
+    "growth": ["growth hack", "viral", "seo", "content market", "cold email",
+               "outbound", "inbound", "conversion rate", "a/b test", "landing page"],
+    "monetization": ["monetize", "pricing", "revenue", "profit", "affiliate",
+                     "sponsorship", "ad revenue", "paywall", "micro-saas"],
+    "china_出海": ["china", "chinese", "出海", "wechat", "alibaba", "bytedance",
+                   "tencent", "xiaomi", "shein", "temu", "tiktok", "cross-border"],
+}
 
-## 三道筛子标准
+# 第二道筛：可执行性信号词（权重 2）
+ACTIONABLE_KEYWORDS = [
+    "how to", "tutorial", "step by step", "guide", "blueprint", "template",
+    "checklist", "framework", "strategy", "playbook", "case study", "example",
+    "launch", "ship", "shipped", "revenue report", "income report",
+    "monthly report", "grew from", "went from", "scaled to",
+    "first 100", "first 1000", "customer acquisition", "cold outreach",
+    "${number}k", "${number}m", "million", "thousand",
+]
 
-### 第一道：赛道信号筛
-- 是否涉及 AI/ML、SaaS、开发者工具、自动化、出海、Creator Economy 赛道？
-- 是否涉及新型商业模式、定价策略、增长黑客、用户获取新范式？
-- 是否属于「有用的信号」而非纯技术实现细节或大公司 PR 通稿？
-→ 不通过则直接返回 {"pass": false}
+# 第三道筛：深度信号词（权重 1）
+DEPTH_KEYWORDS = [
+    "insight", "analysis", "breakdown", "deep dive", "retrospective",
+    "lesson learned", "mistake", "failure", "pivot", "experiment",
+    "benchmark", "comparison", "vs", "versus", "alternative to",
+    "underrated", "overlooked", "hidden", "secret",
+]
 
-### 第二道：可执行性筛
-- 该信息能否在 1-3 个月内转化为可落地的商业行动？
-- 是否存在「先发优势窗口」或「信息不对称红利」？
-- 核心逻辑是否能被独立开发者或小团队复用？
-→ 不通过则直接返回 {"pass": false}
+# 减分项（大公司 PR、纯技术细节、噪音）
+NEGATIVE_KEYWORDS = [
+    "press release", "funding round", "series a", "series b", "series c",
+    "ipo", "acqui-hire", "quarterly earnings", "shareholder",
+    "patch notes", "bug fix", "hotfix", "version bump",
+    "crypto", "nft", "blockchain", "web3", "token", "metaverse",
+    "deployed", "cia", "nsa", "regulation", "ban", "lawsuit",
+    "podcast", "episode", "sponsor", "advertisement",
+]
 
-### 第三道：深加工筛
-对通过的文章进行以下提炼：
-- 一句话核心洞察（中文，40字以内）
-- 商业模式拆解（如何赚钱）
-- 关键数据/指标（如有）
-- 对中国出海创业者的启示（2-3条）
-- 可立即执行的行动建议（1条）
-
-## 输出格式（严格 JSON）
-{{
-  "pass": true/false,
-  "score": 1-10,
-  "title_cn": "中文标题",
-  "insight": "一句话核心洞察",
-  "business_model": "商业模式拆解",
-  "key_data": "关键数据或留空",
-  "china_insights": ["启示1", "启示2"],
-  "action_item": "可立即执行的行动建议",
-  "tags": ["标签1", "标签2"]
-}}
-只输出 JSON，不要任何多余文字。"""
+# 中文关键词翻译表（用于输出）
+CN_TRANSLATIONS = {
+    "ai": "AI/人工智能", "saas": "SaaS", "devtools": "开发者工具",
+    "automation": "自动化", "indie_hacker": "独立开发者",
+    "growth": "增长", "monetization": "变现", "china_出海": "中国出海",
+}
 
 
-# ========== 核心函数 ==========
+def compute_score_and_tags(title, content):
+    """计算文章的商业相关度评分和标签"""
+    text = (title + " " + content).lower()
+    score = 0
+    matched_tags = []
+    tag_scores = {}
 
+    # 先检查减分项
+    neg_hits = sum(1 for kw in NEGATIVE_KEYWORDS if kw in text)
+    if neg_hits >= 3:
+        return 0, ["不相关"]
+
+    # 第一道：赛道信号
+    for tag, keywords in SIGNAL_KEYWORDS.items():
+        hits = sum(1 for kw in keywords if kw in text)
+        if hits >= 2:
+            matched_tags.append(tag)
+            tag_scores[tag] = min(hits, 5)
+            score += hits * 3
+
+    # 如果没有任何赛道匹配，直接淘汰
+    if score == 0:
+        return 0, []
+
+    # 第二道：可执行性
+    actionable_hits = sum(1 for kw in ACTIONABLE_KEYWORDS if kw in text)
+    score += actionable_hits * 2
+
+    # 第三道：深度
+    depth_hits = sum(1 for kw in DEPTH_KEYWORDS if kw in text)
+    score += depth_hits * 1
+
+    # 内容长度加分（有内容的文章更好）
+    if len(text) > 1000:
+        score += 2
+    if len(text) > 3000:
+        score += 3
+
+    # 标题包含数字（数据驱动型文章）
+    if re.search(r'\d', title):
+        score += 2
+
+    # 标题包含问号（通常是深度分析）
+    if '?' in title or '？' in title:
+        score += 1
+
+    # 归一化到 1-10
+    final_score = min(max(int(score / 5), 1), 10)
+
+    return final_score, matched_tags
+
+
+def extract_metrics(text):
+    """提取关键数据指标"""
+    metrics = []
+    patterns = [
+        r'(\$\d[\d,]*(?:\.\d+)?[KkMmBb]?)',  # 金额
+        r'(\d[\d,]*\s*(?:users|customers|downloads|stars|revenue))',  # 用户数等
+        r'(\d+\s*(?:%|percent|times|x)\s*(?:increase|growth|improve))',  # 增长率
+        r'(\d+\s*(?:days?|weeks?|months?|hours?)\s+(?:to|of))',  # 时间框架
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        metrics.extend(matches[:3])
+    return list(set(metrics))[:5]
+
+
+def extract_action_item(title, content, tags):
+    """为文章生成可执行行动建议模板"""
+    text = title + " " + content[:1000]
+
+    templates = {
+        "ai": "评估该 AI 方案能否集成到现有产品中作为差异化功能",
+        "saas": "分析该定价/增长策略是否适用于你的目标市场",
+        "devtools": "检查该工具/框架能否降低你的开发成本或提升效率",
+        "automation": "探索能否用类似自动化思路简化你的运营流程",
+        "indie_hacker": "参考该作者的 MVP 思路和营销路径",
+        "growth": "测试该增长策略在你自己项目中的可行性",
+        "monetization": "评估该变现模式与你的用户画像是否匹配",
+        "china_出海": "研究该市场机会是否适合中国团队切入",
+    }
+
+    if tags:
+        return templates.get(tags[0], "对比该案例与你的业务，列出 3 个可借鉴点")
+    return "通读原文，提炼 1 个可在一周内执行的点"
+
+
+def build_markdown_section(article, score, tags, metrics):
+    """构建单篇 Markdown 板块"""
+    tags_cn = [CN_TRANSLATIONS.get(t, t) for t in tags]
+    tags_md = " ".join(f"`{t}`" for t in tags_cn)
+    stars = "⭐" * min(score, 10)
+    action = extract_action_item(article["title"], article["content"], tags)
+
+    metrics_str = "、".join(metrics) if metrics else "未提取到关键数据"
+
+    # 生成摘要（取前 200 字）
+    summary = article["content"][:200].replace("\n", " ").strip()
+    if len(article["content"]) > 200:
+        summary += "..."
+
+    return f"""### {article['title']}
+
+| 字段 | 内容 |
+|------|------|
+| **评分** | {stars} ({score}/10) |
+| **标签** | {tags_md} |
+| **原文** | [阅读原文]({article['link']}) |
+| **来源** | {article['source']} |
+| **关键数据** | {metrics_str} |
+
+> **摘要**：{summary}
+
+**可执行行动**：{action}
+
+---
+"""
+
+
+def build_daily_header():
+    today = datetime.date.today()
+    return f"""# 海外商业情报每日看板
+
+**日期**：{today.strftime('%Y年%m月%d日')}（{today.strftime('%A')}）
+**生成时间**：{datetime.datetime.now().strftime('%H:%M:%S')}
+**引擎**：规则引擎 v2 · Zero API Key
+
+---
+
+"""
+
+
+# ========== RSS 抓取 ==========
 def fetch_rss_articles(source_config):
-    """抓取单个 RSS 源的文章列表"""
     articles = []
     try:
         feed = feedparser.parse(source_config["url"])
-        entries = feed.entries[: source_config["max_articles"]]
-        for entry in entries:
-            # 提取正文
+        for entry in feed.entries[:source_config["max"]]:
             content = ""
             if hasattr(entry, "content") and entry.content:
                 content = entry.content[0].get("value", "")
@@ -142,14 +249,13 @@ def fetch_rss_articles(source_config):
             elif hasattr(entry, "description"):
                 content = entry.description
 
-            # HTML → 纯文本
             if content:
                 h2t = html2text.HTML2Text()
                 h2t.ignore_links = False
                 h2t.ignore_images = True
                 content = h2t.handle(content)
 
-            content = content[: CONFIG["max_content_length"]]
+            content = content[:CONFIG["max_content_length"]]
 
             articles.append({
                 "title": entry.get("title", "无标题"),
@@ -160,12 +266,10 @@ def fetch_rss_articles(source_config):
             })
     except Exception as e:
         print(f"[RSS错误] {source_config['name']}: {e}")
-
     return articles
 
 
 def load_processed_hashes(output_dir):
-    """加载已处理文章的去重哈希"""
     dedup_path = Path(output_dir) / CONFIG["dedup_file"]
     if dedup_path.exists():
         return set(json.loads(dedup_path.read_text(encoding="utf-8")))
@@ -173,199 +277,67 @@ def load_processed_hashes(output_dir):
 
 
 def save_processed_hashes(output_dir, hashes):
-    """保存已处理哈希"""
     dedup_path = Path(output_dir) / CONFIG["dedup_file"]
     dedup_path.write_text(json.dumps(list(hashes)), encoding="utf-8")
 
 
-def compute_article_hash(article):
-    """计算文章去重哈希"""
-    raw = f"{article['title']}{article['link']}"
-    return hashlib.md5(raw.encode()).hexdigest()
-
-
-def filter_article(article):
-    """调用 LLM API 进行三道筛子过滤"""
-    prompt = FILTER_PROMPT.format(
-        title=article["title"],
-        source=article["source"],
-        content=article["content"],
-    )
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {CONFIG['llm_api_key']}",
-    }
-
-    payload = {
-        "model": CONFIG["llm_model"],
-        "messages": [
-            {"role": "system", "content": "你是严格的商业分析师，只输出 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 800,
-    }
-
-    try:
-        resp = requests.post(
-            CONFIG["llm_api_url"], headers=headers, json=payload, timeout=60
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        content = result["choices"][0]["message"]["content"].strip()
-
-        # 清理可能的 ```json 包裹
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
-
-        return json.loads(content)
-    except json.JSONDecodeError:
-        print(f"[LLM解析失败] {article['title'][:40]} → 返回非JSON")
-        return {"pass": False}
-    except requests.exceptions.RequestException as e:
-        print(f"[LLM请求失败] {article['title'][:40]}: {e}")
-        return {"pass": False}
-    except Exception as e:
-        print(f"[LLM未知错误] {article['title'][:40]}: {e}")
-        return {"pass": False}
-
-
-def build_markdown_section(result, article):
-    """将过滤结果构建为 Markdown 板块"""
-    if not result.get("pass"):
-        return ""
-
-    tags_md = " ".join(f"`{t}`" for t in result.get("tags", []))
-    insights_md = "\n".join(f"- {s}" for s in result.get("china_insights", []))
-
-    return f"""### {result.get('title_cn', article['title'])}
-
-| 字段 | 内容 |
-|------|------|
-| **评分** | {'⭐' * min(result.get('score', 5), 10)} ({result.get('score', 'N/A')}/10) |
-| **标签** | {tags_md} |
-| **原文** | [{article['title']}]({article['link']}) |
-| **来源** | {article['source']} |
-
-> **核心洞察**：{result.get('insight', '无')}
-
-**商业模式拆解**：{result.get('business_model', '无')}
-
-**关键数据**：{result.get('key_data', '无') if result.get('key_data') else '未提及'}
-
-**对中国出海创业者的启示**：
-{insights_md}
-
-**可执行行动**：{result.get('action_item', '无')}
-
----
-"""
-
-
-def build_daily_header():
-    """构建每日报告的头部"""
-    today = datetime.date.today()
-    return f"""# 海外商业情报每日看板
-
-**日期**：{today.strftime('%Y年%m月%d日')}（{today.strftime('%A')}）
-**生成时间**：{datetime.datetime.now().strftime('%H:%M:%S')}
-
----
-
-"""
+def compute_hash(article):
+    return hashlib.md5(f"{article['title']}{article['link']}".encode()).hexdigest()
 
 
 def main():
     output_dir = Path(CONFIG["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 加载去重哈希
     processed_hashes = load_processed_hashes(output_dir)
 
-    # 1. 抓取所有 RSS 源
+    # 1. 抓取
     all_articles = []
     for source in CONFIG["rss_sources"]:
         print(f"[抓取] {source['name']} ...")
         articles = fetch_rss_articles(source)
-        print(f"  → 获取 {len(articles)} 篇")
         all_articles.extend(articles)
 
     # 去重
     new_articles = []
     for a in all_articles:
-        h = compute_article_hash(a)
+        h = compute_hash(a)
         if h not in processed_hashes:
             a["_hash"] = h
             new_articles.append(a)
 
-    print(f"\n[汇总] 共 {len(all_articles)} 篇，去重后 {len(new_articles)} 篇新文章")
-
+    print(f"\n[汇总] {len(all_articles)} 篇，去重后 {len(new_articles)} 篇新文章")
     if not new_articles:
-        print("[完成] 无新文章，跳过过滤")
+        print("[完成] 无新文章")
         return
 
-    # 2. 过滤 + 翻译
-    passed_results = []
-    new_hashes = set()
+    # 2. 过滤评分
+    passed = []
+    for a in new_articles:
+        score, tags = compute_score_and_tags(a["title"], a["content"])
+        if score >= 3 and tags:  # 阈值：3 分以上且有赛道标签
+            metrics = extract_metrics(a["content"])
+            passed.append({"article": a, "score": score, "tags": tags, "metrics": metrics})
+            processed_hashes.add(a["_hash"])
+            print(f"  ✅ [{score}/10] {a['title'][:50]}")
 
-    for i, article in enumerate(new_articles):
-        print(f"[过滤 {i+1}/{len(new_articles)}] {article['title'][:50]}...")
-        result = filter_article(article)
-
-        new_hashes.add(article["_hash"])
-
-        if result.get("pass"):
-            result["_article"] = article
-            passed_results.append(result)
-            print(f"  ✅ 通过 (评分 {result.get('score', '?')}/10)")
-        else:
-            print(f"  ❌ 未通过")
-
-        # 速率限制
-        if i < len(new_articles) - 1:
-            time.sleep(CONFIG["request_interval"])
-
-    # 更新去重哈希
-    processed_hashes.update(new_hashes)
     save_processed_hashes(output_dir, processed_hashes)
 
-    # 3. 按评分排序
-    passed_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    # 按评分排序
+    passed.sort(key=lambda x: x["score"], reverse=True)
+    print(f"\n[通过] {len(passed)} 篇")
 
-    print(f"\n[结果] 通过过滤: {len(passed_results)} 篇")
-
-    # 4. 构建 Markdown 输出
+    # 3. 生成 Markdown
     output_path = output_dir / CONFIG["output_file"]
-
-    # 如果已有文件，追加模式
-    if output_path.exists():
-        existing = output_path.read_text(encoding="utf-8")
-        # 在现有内容末尾追加，不覆盖历史
-    else:
-        existing = ""
+    existing = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
 
     md = build_daily_header()
-    md += f"## 今日精选（共 {len(passed_results)} 条）\n\n"
+    md += f"## 今日精选（共 {len(passed)} 条）\n\n"
+    for p in passed:
+        md += build_markdown_section(p["article"], p["score"], p["tags"], p["metrics"])
 
-    for r in passed_results:
-        md += build_markdown_section(r, r["_article"])
-
-    # 追加到文件
-    full_content = existing + md
-    output_path.write_text(full_content, encoding="utf-8")
-
-    print(f"[完成] 看板已写入: {output_path.absolute()}")
-    print(f"        通过文章数: {len(passed_results)}")
-
-    # 输出简短摘要
-    if passed_results:
-        print("\n📋 今日精选摘要：")
-        for r in passed_results[:5]:
-            print(f"  [{r.get('score', '?')}/10] {r.get('title_cn', '?')} — {r.get('insight', '')[:60]}...")
+    output_path.write_text(existing + md, encoding="utf-8")
+    print(f"[完成] 看板: {output_path.absolute()}  |  通过 {len(passed)} 篇")
 
 
 if __name__ == "__main__":
