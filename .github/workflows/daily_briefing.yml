@@ -1,0 +1,38 @@
+name: Overseas Intelligence Filter
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  daily-briefing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: pip install feedparser requests html2text
+
+      - name: Run Filter Script
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_URL: ${{ secrets.LLM_API_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          OUTPUT_DIR: ./output
+        run: python overseas_filter.py
+
+      - name: Commit & Push Output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/ *.json || true
+          git diff --staged --quiet || git commit -m "Daily briefing $(date +'%Y-%m-%d')"
+          git push
