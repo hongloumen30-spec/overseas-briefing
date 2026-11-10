@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Opus 原文</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 14px; font: 15px/1.65 system-ui, sans-serif; }
+  .caption { font-size: 12px; opacity: .7; margin-bottom: 12px; }
+  #answer { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: inherit; }
+</style>
+</head>
+<body>
+<div class="caption">Claude Opus 4.7 · TokenHub API 原文（未经过 GPT 改写）</div>
+<pre id="answer" aria-live="polite">正在等待模型响应…</pre>
+<script>
+(() => {
+  const host = window.parent;
+  let initialized = false;
+  const node = document.getElementById("answer");
+  window.addEventListener("message", (event) => {
+    if (event.source !== host || event.data?.jsonrpc !== "2.0") return;
+    if (event.data.id === 1 && event.data.result?.protocolVersion) {
+      initialized = true;
+      host.postMessage({jsonrpc: "2.0", method: "ui/notifications/initialized"}, "*");
+      return;
+    }
+    if (!initialized || event.data.method !== "ui/notifications/tool-result") return;
+    const parts = event.data.params?.content || [];
+    const block = parts.find(part => part?.type === "text" && typeof part.text === "string");
+    node.textContent = block ? block.text : "未收到可显示的文本。请检查接口响应。";
+  });
+  host.postMessage({
+    jsonrpc: "2.0", id: 1, method: "ui/initialize",
+    params: {
+      appInfo: {name: "tokenhub-claude-viewer", version: "0.1.0"},
+      appCapabilities: {}, protocolVersion: "2026-01-26"
+    }
+  }, "*");
+})();
+</script>
+</body>
+</html>
